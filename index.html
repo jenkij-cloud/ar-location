@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AR ตามพิกัด · 0214381 Lab 3</title>
+  <script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@ar-js-org/ar.js@3.4.8/three.js/build/ar-threex-location-only.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@ar-js-org/ar.js@3.4.8/aframe/build/aframe-ar.js"></script>
+  <script>
+    // ให้วัตถุหันหน้าเข้าหาผู้ใช้เสมอ (อ่านป้ายได้จากทุกทิศ)
+    AFRAME.registerComponent('face-me', {
+      tick: function () {
+        const cam = this.el.sceneEl.camera;
+        if (!cam) return;
+        const me = new THREE.Vector3(), target = new THREE.Vector3();
+        this.el.object3D.getWorldPosition(me); cam.getWorldPosition(target);
+        target.y = me.y;                       // หมุนเฉพาะแนวนอน ป้ายไม่เอียงขึ้นลง
+        this.el.object3D.lookAt(target);
+      }
+    });
+  </script>
+  <style>
+    #hud { position: fixed; top: 10px; left: 10px; right: 10px; z-index: 10;
+           background: rgba(42,27,92,.88); color: #fff; border-radius: 12px;
+           padding: 10px 14px; font: 14px/1.5 system-ui, sans-serif;
+           box-shadow: 0 4px 15px rgba(0,0,0,0.35); }
+    #hud b { color: #C9B8F0; }
+    .hud-btn {
+      display: inline-block; margin-top: 6px; padding: 5px 12px;
+      background: #4A90E2; color: #fff; border-radius: 6px; border: none;
+      font-size: 13px; font-weight: bold; cursor: pointer;
+    }
+    .hud-btn:active { background: #357ABD; }
+  </style>
+</head>
+<body style="margin: 0; overflow: hidden;">
+  <div id="hud">กำลังขอตำแหน่ง GPS… (อนุญาตกล้องและตำแหน่ง)</div>
+
+  <a-scene vr-mode-ui="enabled: false"
+           arjs="sourceType: webcam; videoTexture: true; debugUIEnabled: false"
+           renderer="antialias: true; alpha: true">
+
+    <!-- กล้องที่รู้ตำแหน่ง GPS ของผู้ใช้ · gpsMinDistance = 0 เพื่อให้อัปเดตตำแหน่งตามทุกก้าวที่เดิน -->
+    <a-camera gps-new-camera="gpsMinDistance: 0; positionMinAccuracy: 1000" far="10000"></a-camera>
+
+    <!-- หน่วยของขนาดในโหมดนี้คือ "เมตรจริง" วัตถุที่อยู่ห่าง 10-20 เมตรจะเห็นได้ชัดเจนและขยับตามก้าวเดินจริง -->
+
+    <!-- ① จุด A · พิกัดหลักของผู้ใช้ -->
+    <a-entity data-name="จุด A" gps-new-entity-place="latitude: 7.8086114; longitude: 99.9414822">
+      <a-box color="#5A3EBD" scale="3 3 3" position="0 1.5 0"
+             animation="property: rotation; to: 0 360 0; loop: true; dur: 8000; easing: linear"></a-box>
+      <a-text face-me value="POINT A" align="center" color="#FFFFFF" width="30" position="0 4.5 0"></a-text>
+    </a-entity>
+
+    <!-- ② จุด B · ห่างไปทางทิศเหนือ ~11 เมตร -->
+    <a-entity data-name="จุด B" gps-new-entity-place="latitude: 7.8087114; longitude: 99.9414822">
+      <a-sphere color="#FF78AA" radius="1.8" position="0 1.8 0"></a-sphere>
+      <a-text face-me value="POINT B" align="center" color="#FFFFFF" width="30" position="0 4.5 0"></a-text>
+    </a-entity>
+
+    <!-- ③ จุด C · ห่างไปทางทิศตะวันออก ~11 เมตร -->
+    <a-entity data-name="จุด C" gps-new-entity-place="latitude: 7.8086114; longitude: 99.9415822">
+      <a-entity face-me position="0 2.5 0">
+        <a-plane color="#2A1B5C" width="10" height="4"></a-plane>
+        <a-text value="WELCOME C" align="center" color="#FFCE54" width="30" position="0 0 0.1"></a-text>
+      </a-entity>
+    </a-entity>
+
+    <!-- ④ ท้าทาย: คัดลอกบล็อก a-entity ทั้งก้อนมาวางเพิ่มเป็นจุด D ที่ตำแหน่งใหม่ -->
+
+  </a-scene>
+
+  <script>
+    // โหมดจำลอง: เปิดลิงก์แล้วต่อท้ายด้วย ?sim จะ "ยืน" ห่างจุด A ไปทางใต้ประมาณ 33 เมตร (ใช้ในห้องหรือบนคอมพิวเตอร์)
+    const SIM = new URLSearchParams(location.search).has('sim');
+    const hud = document.getElementById('hud');
+    const scene = document.querySelector('a-scene');
+    const cam = document.querySelector('[gps-new-camera]');
+    const places = [...document.querySelectorAll('[gps-new-entity-place]')];
+
+    // ตัวแปรพิกัดแบบเรียลไทม์ (Smooth Interpolation 60 FPS)
+    let currentLat = null, currentLon = null;
+    let targetLat = null, targetLon = null;
+    let me = null, accuracy = null;
+    let stepCount = 0, currentHeading = 0;
+    let lastStepTime = 0, lastAccel = 9.8;
+
+    // คำนวณระยะทางจริง (เมตร) ด้วยสูตร Haversine
+    function calcDistance(lat1, lon1, lat2, lon2) {
+      const R = 6371000;
+      const dLat = (lat2 - lat1) * Math.PI / 180;
+      const dLon = (lon2 - lon1) * Math.PI / 180;
+      const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                Math.sin(dLon / 2) * Math.sin(dLon / 2);
+      return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    }
+
+    // ฟังก์ชันปักหมุดวัตถุให้อยู่รอบตัวผู้ใช้ 10 เมตร ทันที (ให้เดินเข้าไปหาได้เลย)
+    window.pinAroundMe = function() {
+      if (!me) {
+        alert('กำลังรอพิกัด GPS จากมือถือ กรุณารอสักครู่ครับ...');
+        return;
+      }
+      const offsets = [
+        { lat: me.latitude + 0.000095, lon: me.longitude },
+        { lat: me.latitude, lon: me.longitude + 0.000095 },
+        { lat: me.latitude - 0.000095, lon: me.longitude }
+      ];
+      places.forEach((p, idx) => {
+        if (offsets[idx]) {
+          p.setAttribute('gps-new-entity-place', {
+            latitude: offsets[idx].lat,
+            longitude: offsets[idx].lon
+          });
+        }
+      });
+      updateHUD();
+      alert('ปักหมุดวัตถุไว้รอบตัวคุณในระยะ 10 เมตรเรียบร้อยแล้ว!');
+    };
+
+    function updateHUD() {
+      if (!me) return;
+      const acc = SIM ? 'โหมดจำลอง' : (accuracy ? '± ' + Math.round(accuracy) + ' ม.' : '…');
+      const rows = places.map(p => {
+        let d = p.components && p.components['gps-new-entity-place'] ? p.components['gps-new-entity-place'].distance : undefined;
+        if (d === undefined) {
+          const attr = p.getAttribute('gps-new-entity-place');
+          if (attr && attr.latitude !== undefined) {
+            d = calcDistance(me.latitude, me.longitude, parseFloat(attr.latitude), parseFloat(attr.longitude));
+          }
+        }
+        return `${p.dataset.name}: <b>${d === undefined ? '…' : d.toFixed(1) + ' ม.'}</b>`;
+      }).join(' · ');
+
+      const motionInfo = !SIM ? ` · 🚶 ก้าว: <b>${stepCount}</b> · 🧭 ทิศ: <b>${Math.round(currentHeading)}°</b>` : '';
+      const pinBtn = !SIM ? `<br><button class="hud-btn" onclick="pinAroundMe()">🎯 ปักหมุดวัตถุรอบตัวฉัน (10 ม.)</button>` : '';
+
+      hud.innerHTML = `ฉันอยู่ที่ <b>${me.latitude.toFixed(7)}, ${me.longitude.toFixed(7)}</b> (⚡ เรียลไทม์)<br>` +
+                      `ความแม่นยำ <b>${acc}</b>${motionInfo}<br>${rows}${pinBtn}`;
+    }
+
+    // ลูป Animation Frame 60 FPS: อัปเดตพิกัดและการเคลื่อนที่อย่างลื่นไหล
+    function loop() {
+      if (targetLat !== null && targetLon !== null) {
+        if (currentLat === null) {
+          currentLat = targetLat;
+          currentLon = targetLon;
+        } else {
+          // ค่อยๆ Lerp พิกัดให้ตัวเลขและการเคลื่อนที่ใน 3D ขยับอย่างต่อเนื่อง นุ่มนวล
+          currentLat += (targetLat - currentLat) * 0.25;
+          currentLon += (targetLon - currentLon) * 0.25;
+        }
+        me = { latitude: currentLat, longitude: currentLon };
+
+        // ส่งตำแหน่งเข้าโมเดล 3D ของ AR.js แบบ 60 FPS
+        if (cam && cam.components && cam.components['gps-new-camera'] && cam.components['gps-new-camera'].threeLoc) {
+          const loc = cam.components['gps-new-camera'].threeLoc;
+          if (loc._camera) {
+            loc.setWorldPosition(loc._camera, currentLon, currentLat);
+          }
+        }
+        updateHUD();
+      }
+      requestAnimationFrame(loop);
+    }
+    requestAnimationFrame(loop);
+
+    // รับทิศทางจากเข็มทิศเครื่อง
+    window.addEventListener('deviceorientation', e => {
+      if (e.webkitCompassHeading !== undefined) {
+        currentHeading = e.webkitCompassHeading;
+      } else if (e.alpha !== undefined) {
+        currentHeading = (360 - e.alpha) % 360;
+      }
+    });
+
+    // ตรวจจับการก้าวเดินจริงจาก Accelerometer (ก้าวปุ๊บ พิกัดขยับทันทีแบบ Dead Reckoning)
+    window.addEventListener('devicemotion', e => {
+      const acc = e.accelerationIncludingGravity;
+      if (!acc) return;
+      const mag = Math.sqrt(acc.x * acc.x + acc.y * acc.y + acc.z * acc.z);
+      const now = performance.now();
+
+      // ตรวจจับแรงกระแทกของก้าวเดิน (ความเร่งสวิงเกินเกณฑ์ และห่างกันอย่างน้อย 300ms)
+      if (mag > 11.8 && (mag - lastAccel) > 1.2 && (now - lastStepTime) > 300) {
+        lastStepTime = now;
+        stepCount++;
+        if (targetLat !== null && targetLon !== null) {
+          // ก้าวละประมาณ 0.65 เมตร ไปตามทิศทางที่เครื่องหันอยู่
+          const stepDist = 0.65;
+          const rad = currentHeading * Math.PI / 180;
+          const dLat = (stepDist * Math.cos(rad)) / 111139;
+          const dLon = (stepDist * Math.sin(rad)) / (111139 * Math.cos(targetLat * Math.PI / 180));
+          targetLat += dLat;
+          targetLon += dLon;
+        }
+      }
+      lastAccel = mag;
+    });
+
+    // ขอสิทธิ์เซ็นเซอร์สำหรับ iOS Safari เมื่อแตะหน้าจอ
+    function requestPermissions() {
+      if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+        DeviceOrientationEvent.requestPermission().catch(console.error);
+      }
+      if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+        DeviceMotionEvent.requestPermission().catch(console.error);
+      }
+    }
+    window.addEventListener('click', requestPermissions);
+    window.addEventListener('touchstart', requestPermissions);
+
+    // จัดการพิกัดใหม่จาก GPS Hardware
+    function onGpsPosition(p) {
+      targetLat = p.coords.latitude;
+      targetLon = p.coords.longitude;
+      accuracy = p.coords.accuracy;
+
+      if (cam && cam.components && cam.components['gps-new-camera'] && cam.components['gps-new-camera'].threeLoc) {
+        cam.components['gps-new-camera'].threeLoc._gpsReceived(p);
+      }
+    }
+
+    scene.addEventListener('loaded', () => {
+      if (SIM) {
+        const a = places[0].getAttribute('gps-new-entity-place');
+        targetLat = parseFloat(a.latitude) - 0.0003;
+        targetLon = parseFloat(a.longitude) + 0.000001;
+        setTimeout(() => {
+          cam.setAttribute('gps-new-camera', {
+            simulateLatitude: targetLat,
+            simulateLongitude: targetLon
+          });
+        }, 500);
+      }
+    });
+
+    // ตรวจสอบความปลอดภัย HTTPS (มือถือจำเป็นต้องใช้ HTTPS จึงจะยอมเปิด GPS)
+    if (!SIM && location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
+      hud.innerHTML = `⚠️ เบราว์เซอร์บล็อก GPS บน HTTP ธรรมดา กรุณาเปิดผ่าน HTTPS (เช่น GitHub Pages)`;
+    }
+
+    // ฟังก์ชันติดตาม GPS แบบความแม่นยำสูงและดึงข้อมูลต่อเนื่อง (Active Polling + Watch)
+    if (!SIM && navigator.geolocation) {
+      navigator.geolocation.watchPosition(
+        onGpsPosition,
+        err => {
+          console.warn('Geolocation error:', err);
+          if (!me) {
+            hud.innerHTML = `⚠️ ไม่สามารถดึงพิกัดได้: ${err.message} (กรุณาเปิด GPS และอนุญาตสิทธิ์)`;
+          }
+        },
+        { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
+      );
+
+      // กระตุ้นการอ่าน GPS ทุก 800ms ป้องกันชิป GPS เข้าโหมดประหยัดพลังงาน
+      setInterval(() => {
+        navigator.geolocation.getCurrentPosition(onGpsPosition, () => {}, {
+          enableHighAccuracy: true,
+          maximumAge: 0,
+          timeout: 2000
+        });
+      }, 800);
+    }
+  </script>
+</body>
+</html>
